@@ -1,10 +1,12 @@
 use rand::prelude::*;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::hash::Hash;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::iter;
+use std::time::Instant;
 
 #[derive(Debug, PartialEq, Hash, Eq)]
 struct Node {
@@ -61,8 +63,6 @@ fn load_instance(path: &str) -> Instance {
         nodes: nodes.collect(),
     }
 }
-
-const TOO_MANY_TRUCKS_PENALTY: f64 = 1.0;
 
 fn calculate_route_penalty(instance: &Instance, route: &[&Node]) -> f64 {
     if route.is_empty() {
@@ -125,7 +125,7 @@ fn calculate_penalty(instance: &Instance, solution: &[Vec<&Node>]) -> f64 {
     let cnt = calculate_num_vehicles_required(solution);
 
     (if cnt as u64 > instance.num_vehicles {
-        TOO_MANY_TRUCKS_PENALTY
+        instance.num_vehicles as f64 - cnt as f64
     } else {
         0.0
     }) + solution
@@ -134,19 +134,25 @@ fn calculate_penalty(instance: &Instance, solution: &[Vec<&Node>]) -> f64 {
         .sum::<f64>()
 }
 
-fn solution_score(instance: &Instance, solution: &[Vec<&Node>]) -> f64 {
+static mut evals: usize = 0;
+
+fn solution_score(instance: &Instance, solution: &[Vec<&Node>]) -> (f64, f64, f64) {
     let cnt = calculate_num_vehicles_required(solution);
 
     let dist = calculate_total_distance(instance, solution);
 
     let penalty = calculate_penalty(instance, solution);
 
-    dist * penalty + cnt as f64 * instance.max_capacity as f64
+    unsafe {
+        evals += 1;
+    }
+
+    (penalty, cnt as f64, dist)
 }
 
 fn solution_info(instance: &Instance, solution: &[Vec<&Node>]) -> String {
     format!(
-        "{} {} {} {}",
+        "{:?} {} {} {}",
         solution_score(instance, solution),
         calculate_num_vehicles_required(solution),
         calculate_total_distance(instance, solution),
@@ -157,6 +163,7 @@ fn solution_info(instance: &Instance, solution: &[Vec<&Node>]) -> String {
 fn construct_random_solution<'a>(instance: &'a Instance) -> Vec<Vec<&'a Node>> {
     let mut rng = SmallRng::from_entropy();
     let mut nodes: Vec<&Node> = instance.nodes.iter().collect();
+
     nodes.shuffle(&mut rng);
 
     let mut routes = Vec::new();
@@ -251,27 +258,44 @@ fn undo_transformation(transformation: Transformation, solution: &mut Vec<Vec<&N
     }
 }
 
-fn search_space<'a>(solution: &'a [Vec<&'a Node>], k: usize) -> Vec<Transformation> {
-    match k {
-        0 => intra_route_swap(solution).collect(),
-        1 => inter_route_move(solution).collect(),
-        2 => branch_route(solution).collect(),
-        _ => unreachable!(),
+fn search_space<'a>(solution: &'a [Vec<&'a Node>]) -> Vec<Transformation> {
+    intra_route_swap(solution)
+        .chain(inter_route_move(solution))
+        .chain(branch_route(solution))
+        .collect()
+}
+
+fn get_transform_target<'a>(
+    transformation: Transformation,
+    solution: &[Vec<&'a Node>],
+) -> &'a Node {
+    match transformation {
+        Transformation::InterMove(i1, i2, i3, i4) => {
+            return solution[i1][i2];
+        }
+        Transformation::IntraSwap(i1, i2, i3) => {
+            return solution[i1][i2];
+        }
+        Transformation::Branch(i1, i2) => {
+            return solution[i1][i2];
+        }
     }
 }
 
-fn local_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<Vec<&'a Node>> {
+fn tabu_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<Vec<&'a Node>> {
     let mut current_best = solution.to_vec();
     let mut current_best_score = solution_score(instance, &current_best);
     let mut current = solution.to_vec();
 
-    let mut k = 0;
+    let mut tabu = HashMap::new();
 
-    loop {
+    for i in 0..1000 {
         let mut best_score = f64::MAX;
         let mut best_transform = None;
 
-        let space = search_space(&current, k);
+        let mut space = search_space(&current);
+
+        space.retain(|transform| !tabu.contains_key(get_transform_target(*transform, &current)));
 
         let initial_route_scores: Vec<f64> = current
             .iter()
@@ -285,9 +309,9 @@ fn local_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<V
 
             let score = match transform {
                 Transformation::InterMove(i1, i2, i3, i4) => {
-                    let mut s1 = calculate_route_penalty(instance, &current[i1])
+                    let s1 = calculate_route_penalty(instance, &current[i1])
                         * calculate_route_distance(instance, &current[i1]);
-                    let mut s2 = calculate_route_penalty(instance, &current[i3])
+                    let s2 = calculate_route_penalty(instance, &current[i3])
                         * calculate_route_distance(instance, &current[i3]);
                     s1 - initial_route_scores[i1] + s2 - initial_route_scores[i3]
                 }
@@ -304,6 +328,7 @@ fn local_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<V
                     s1 - initial_route_scores[i1] + s2
                 }
             };
+
             if best_transform.is_none() || score < best_score {
                 best_score = score;
                 best_transform = Some(transform);
@@ -316,6 +341,10 @@ fn local_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<V
             break;
         }
 
+        tabu.insert(
+            get_transform_target(best_transform.unwrap(), &current),
+            1000,
+        );
         apply_transformation(best_transform.unwrap(), &mut current);
         current = current
             .iter()
@@ -324,18 +353,26 @@ fn local_search<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<V
             .collect();
         let current_score = solution_score(instance, &current);
 
-        println!("{} {}", current_score, solution_info(instance, &current));
+        // println!(
+        //     "{:?} {} {}",
+        //     current_score,
+        //     solution_info(instance, &current),
+        //     tabu.len()
+        // );
 
         if current_score < current_best_score {
             current_best_score = current_score;
             current_best = current.clone();
-            k = 0;
-        } else {
-            k += 1;
 
-            if k == 3 {
+            if current_score.0 == 0.0 {
                 break;
             }
+        }
+
+        tabu.retain(|k, v| *v != 0);
+
+        for (k, v) in tabu.iter_mut() {
+            *v -= 1;
         }
     }
 
@@ -485,25 +522,23 @@ fn vlns<'a>(instance: &'a Instance, solution: &[Vec<&'a Node>]) -> Vec<Vec<&'a N
             }
         }
 
-        println!(
-            "{} {}",
-            current_score,
-            solution_info(instance, &best_candidate)
-        );
+        //println!("{:?} {}", best_score, solution_info(instance, &current));
 
         if best_score < current_score {
             current_score = best_score;
             current = best_candidate;
+
             repeats = 0;
+            k = 0;
         } else {
             k += 1;
-            repeats += 1;
 
             if k == 2 {
                 k = 0;
+                repeats += 1;
             }
 
-            if repeats == 20 {
+            if repeats == 10 {
                 break;
             }
         }
@@ -540,31 +575,55 @@ fn route_to_string(instance: &Instance, route: &[&Node]) -> String {
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
-    let instance = load_instance(&args.next().expect("Expected the path to an instance."));
+    let args = env::args().skip(1).collect::<Vec<String>>();
+    let instance = load_instance(&args[0]);
+    let time_limit = args[2].parse::<u64>().unwrap();
 
-    let solution = construct_random_solution(&instance);
+    let timer = Instant::now();
 
-    println!("vlns start");
-    let solution = vlns(&instance, &solution);
-    println!("vlns done");
+    let mut best = Vec::new();
+    let mut best_score = solution_score(&instance, &best);
+    let mut i = 1;
 
-    println!("ls start");
-    let solution = local_search(&instance, &solution);
-    println!("ls done");
+    while timer.elapsed().as_secs() < time_limit {
+        println!("{} {}", timer.elapsed().as_secs(), time_limit);
+        println!("search {}", i);
+        let solution = construct_random_solution(&instance);
 
-    let score = solution_score(&instance, &solution);
-    println!("{:?}", score);
+        println!("vlns start");
+        let solution = vlns(&instance, &solution);
+        //println!("vlns done");
 
-    let total_distance = calculate_total_distance(&instance, &solution);
+        println!("tabu start");
+        let solution = tabu_search(&instance, &solution);
+        //println!("tabu done");
 
-    let solution_file = args.next().expect("Expected solution path.");
+        let score = solution_score(&instance, &solution);
+        //println!("{:?}", score);
+
+        if score.0 == 0.0 {
+            if score < best_score || best.is_empty() {
+                best_score = score;
+                best = solution;
+            }
+        }
+
+        i += 1;
+    }
+
+    let total_distance = calculate_total_distance(&instance, &best);
+
+    let solution_file = &args[1];
 
     let mut f = File::create(solution_file).unwrap();
 
-    writeln!(f, "{}", solution.len());
-    for (i, route) in solution.into_iter().enumerate() {
+    writeln!(f, "{}", best.len());
+    for (i, route) in best.into_iter().enumerate() {
         writeln!(f, "{}: {}", i + 1, route_to_string(&instance, &route));
     }
     writeln!(f, "{}", total_distance);
+
+    unsafe {
+        println!("{}", evals);
+    }
 }
